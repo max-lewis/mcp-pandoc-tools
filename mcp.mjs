@@ -3,8 +3,7 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import { nanoid } from "nanoid";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { sseMiddleware } from "@modelcontextprotocol/sdk/server/sse.js";
+import { Server, sseMiddleware } from "./lib/mcp-sdk/server/index.js";
 
 // ----------- CONFIG VIA ENV -------------
 const PORT = process.env.PORT || 8080;
