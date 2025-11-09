@@ -1,115 +1,107 @@
-import express from "express";
-import axios from "axios";
+import { createServer } from "http";
+import { randomUUID, createHash } from "crypto";
 import fs from "fs";
 import path from "path";
-import { nanoid } from "nanoid";
-import { Server, sseMiddleware } from "./lib/mcp-sdk/server/index.js";
+import { fileURLToPath } from "url";
 
-// ----------- CONFIG VIA ENV -------------
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/* ---------- config ---------- */
 const PORT = process.env.PORT || 8080;
+const PANDOC_BASE = process.env.PANDOC_BASE || ""; // e.g. https://mcp-pandoc-production.up.railway.app
+const PANDOC_API_KEY = process.env.PANDOC_API_KEY || ""; // optional
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ""; // e.g. https://mcp-pandoc-tools.up.railway.app
 
-// Your already-deployed Pandoc service:
-const PANDOC_BASE = process.env.PANDOC_BASE || "https://mcp-pandoc-production.up.railway.app";
-// Only set this if your Pandoc service requires x-api-key (i.e., you set API_KEY on Pandoc):
-const PANDOC_API_KEY = process.env.PANDOC_API_KEY || "";
+if (!PANDOC_BASE) console.warn("WARNING: PANDOC_BASE is not set.");
+if (!PUBLIC_BASE_URL) console.warn("WARNING: PUBLIC_BASE_URL is not set; links will fail.");
 
-// After you generate a domain for THIS service, set PUBLIC_BASE_URL to that URL and redeploy:
-let PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
-
-// ----------- EXPRESS APP + STORAGE -------------
-const app = express();
-app.use(express.json({ limit: "10mb" }));
-
+/* ---------- tiny store ---------- */
 const TMP_DIR = "/tmp/exports";
 fs.mkdirSync(TMP_DIR, { recursive: true });
+const files = new Map(); // id -> {path, mime, t}
 
-/** id -> { filepath, mime, t } */
-const files = new Map();
+/* ---------- helpers ---------- */
+function ok(res, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(body);
+}
 
-// TTL cleanup (15 minutes)
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, rec] of files.entries()) {
-    if (now - rec.t > 15 * 60 * 1000) {
-      try { fs.unlinkSync(rec.filepath); } catch {}
-      files.delete(id);
-    }
-  }
-}, 5 * 60 * 1000);
+function bad(res, code, msg) {
+  const body = JSON.stringify({ error: msg });
+  res.writeHead(code, { "Content-Type": "application/json" });
+  res.end(body);
+}
 
-// ---------- CORE EXPORT FUNCTION ----------
+async function readJSON(req) {
+  return new Promise((resolve, reject) => {
+    let buf = "";
+    req.setEncoding("utf8");
+    req.on("data", (c) => (buf += c));
+    req.on("end", () => {
+      try { resolve(JSON.parse(buf || "{}")); } catch (e) { reject(e); }
+    });
+  });
+}
+
+function fileId(ext) {
+  const raw = randomUUID() + Date.now();
+  const id = createHash("sha1").update(raw).digest("base64url").slice(0, 16);
+  return `${id}.${ext}`;
+}
+
 async function doExport({ input_format, output_format, content }) {
-  if (!["markdown", "html"].includes(input_format)) throw new Error("input_format must be markdown or html");
-  if (!["docx", "pdf"].includes(output_format)) throw new Error("output_format must be docx or pdf");
-  if (typeof content !== "string") throw new Error("content must be a string");
+  if (!["markdown", "html"].includes(input_format)) {
+    throw new Error("input_format must be 'markdown' or 'html'");
+  }
+  if (!["pdf", "docx"].includes(output_format)) {
+    throw new Error("output_format must be 'pdf' or 'docx'");
+  }
+  if (typeof content !== "string" || !content.length) {
+    throw new Error("content must be a non-empty string");
+  }
 
   const headers = { "Content-Type": "application/json" };
   if (PANDOC_API_KEY) headers["x-api-key"] = PANDOC_API_KEY;
 
-  const resp = await axios.post(
-    `${PANDOC_BASE}/convert`,
-    { input_format, output_format, content },
-    { responseType: "arraybuffer", headers }
-  );
+  const resp = await fetch(`${PANDOC_BASE}/convert`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ input_format, output_format, content }),
+  });
 
-  if (resp.status !== 200) {
-    throw new Error(`pandoc convert failed: HTTP ${resp.status}`);
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`pandoc error ${resp.status}: ${text}`);
   }
 
-  const id = nanoid(12);
+  const buf = Buffer.from(await resp.arrayBuffer());
   const ext = output_format === "docx" ? "docx" : "pdf";
-  const filepath = path.join(TMP_DIR, `${id}.${ext}`);
-  fs.writeFileSync(filepath, Buffer.from(resp.data));
+  const fname = fileId(ext);
+  const fpath = path.join(TMP_DIR, fname);
+  fs.writeFileSync(fpath, buf);
 
   const mime = output_format === "docx"
     ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     : "application/pdf";
 
-  files.set(id, { filepath, mime, t: Date.now() });
-
-  if (!PUBLIC_BASE_URL) throw new Error("PUBLIC_BASE_URL is not set on the MCP server");
-  const link = `${PUBLIC_BASE_URL}/download/${id}`;
-  return { link };
+  files.set(fname, { path: fpath, mime, t: Date.now() });
+  return `${PUBLIC_BASE_URL}/download/${fname}`;
 }
 
-// ---------- HTTP endpoints ----------
-app.get("/healthz", async (req, res) => {
-  try {
-    const r = await axios.get(`${PANDOC_BASE}/healthz`);
-    return res.json({ ok: true, pandoc: r.data });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+/* ---------- cleanup ---------- */
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of files.entries()) {
+    if (now - v.t > 15 * 60 * 1000) { try { fs.unlinkSync(v.path); } catch {} files.delete(k); }
   }
-});
+}, 5 * 60 * 1000);
 
-app.get("/download/:id", (req, res) => {
-  const rec = files.get(req.params.id);
-  if (!rec) return res.status(404).send("Not found");
-  const { filepath, mime } = rec;
-  const filename = path.basename(filepath);
-  res.setHeader("Content-Type", mime);
-  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-  fs.createReadStream(filepath).pipe(res);
-});
-
-app.post("/export", async (req, res) => {
-  try {
-    const { input_format, output_format, content } = req.body || {};
-    const { link } = await doExport({ input_format, output_format, content });
-    res.json({ ok: true, link });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// ----------- MCP SERVER (REMOTE) -------------
-const mcp = new Server({ name: "mcp-pandoc-tools", version: "1.0.0" });
-
-// Tool: convert_to_pdf
-mcp.tool(
+/* ---------- tool schemas (for Claude) ---------- */
+const tools = [
   {
     name: "convert_to_pdf",
-    description: "Convert markdown or HTML to PDF and return a download link",
+    description: "Convert markdown or HTML to PDF and return a download link.",
     inputSchema: {
       type: "object",
       properties: {
@@ -119,18 +111,9 @@ mcp.tool(
       required: ["input_format", "content"]
     }
   },
-  async (args) => {
-    const { input_format, content } = args;
-    const { link } = await doExport({ input_format, output_format: "pdf", content });
-    return { content: [{ type: "text", text: `PDF ready: ${link}` }] };
-  }
-);
-
-// Tool: convert_to_docx
-mcp.tool(
   {
     name: "convert_to_docx",
-    description: "Convert markdown or HTML to DOCX and return a download link",
+    description: "Convert markdown or HTML to DOCX and return a download link.",
     inputSchema: {
       type: "object",
       properties: {
@@ -139,18 +122,82 @@ mcp.tool(
       },
       required: ["input_format", "content"]
     }
-  },
-  async (args) => {
-    const { input_format, content } = args;
-    const { link } = await doExport({ input_format, output_format: "docx", content });
-    return { content: [{ type: "text", text: `DOCX ready: ${link}` }] };
   }
-);
+];
 
-// SSE endpoint for Claude Remote MCP
-app.use("/sse", sseMiddleware(mcp));
+/* ---------- server ---------- */
+const server = createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, "http://localhost");
+    const { pathname } = url;
 
-app.listen(PORT, () => {
-  console.log(`MCP tools listening on :${PORT}`);
-  console.log(`SSE endpoint at /sse`);
+    // health
+    if (req.method === "GET" && pathname === "/healthz") {
+      return ok(res, { ok: true, server: "mcp-pandoc-tools" });
+    }
+
+    // SSE for Claude Remote MCP
+    if (req.method === "GET" && pathname === "/sse") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      // Announce tools immediately
+      res.write(`event: tools\n`);
+      res.write(`data: ${JSON.stringify({ tools })}\n\n`);
+      // Keep alive
+      const iv = setInterval(() => res.write(`: ping\n\n`), 25000);
+      req.on("close", () => clearInterval(iv));
+      return;
+    }
+
+    // Claude will POST tool invocations here
+    if (req.method === "POST" && pathname === "/invoke") {
+      const body = await readJSON(req);
+      const name = body?.name;
+      const args = body?.arguments || {};
+      if (name === "convert_to_pdf") {
+        const link = await doExport({ input_format: args.input_format, output_format: "pdf", content: args.content });
+        return ok(res, { content: [{ type: "text", text: `PDF ready: ${link}` }] });
+      }
+      if (name === "convert_to_docx") {
+        const link = await doExport({ input_format: args.input_format, output_format: "docx", content: args.content });
+        return ok(res, { content: [{ type: "text", text: `DOCX ready: ${link}` }] });
+      }
+      return bad(res, 404, "unknown tool");
+    }
+
+    // Direct HTTP export (optional)
+    if (req.method === "POST" && pathname === "/export") {
+      const body = await readJSON(req);
+      const link = await doExport({
+        input_format: body.input_format,
+        output_format: body.output_format,
+        content: body.content
+      });
+      return ok(res, { ok: true, link });
+    }
+
+    // file download
+    if (req.method === "GET" && pathname.startsWith("/download/")) {
+      const id = pathname.split("/").pop();
+      const rec = files.get(id);
+      if (!rec) return bad(res, 404, "not found");
+      res.writeHead(200, {
+        "Content-Type": rec.mime,
+        "Content-Disposition": `attachment; filename="${id}"`
+      });
+      fs.createReadStream(rec.path).pipe(res);
+      return;
+    }
+
+    bad(res, 404, "not found");
+  } catch (e) {
+    bad(res, 500, String(e?.message || e));
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`mcp-pandoc-tools listening on :${PORT}`);
 });
