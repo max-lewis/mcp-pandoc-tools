@@ -6,7 +6,7 @@
     "start": "node mcp.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^0.1.2",
+    "@modelcontextprotocol/sdk": "0.1.1",
     "axios": "^1.7.7",
     "express": "^4.19.2",
     "nanoid": "^5.0.7"
