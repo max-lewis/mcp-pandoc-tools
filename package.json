@@ -6,7 +6,6 @@
     "start": "node mcp.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "https://codeload.github.com/modelcontextprotocol/sdk/tar.gz/refs/tags/v0.1.0",
     "axios": "^1.7.7",
     "express": "^4.19.2",
     "nanoid": "^5.0.7"
