@@ -11,10 +11,10 @@ const PORT = process.env.PORT || 8080;
 
 // Your already-deployed Pandoc service:
 const PANDOC_BASE = process.env.PANDOC_BASE || "https://mcp-pandoc-production.up.railway.app";
-// If you set an API_KEY on that service, put it here (Railway Variable):
+// Only set this if your Pandoc service requires x-api-key (i.e., you set API_KEY on Pandoc):
 const PANDOC_API_KEY = process.env.PANDOC_API_KEY || "";
 
-// Base URL for this MCP server (after you get a Railway domain, set PUBLIC_BASE_URL to it):
+// After you generate a domain for THIS service, set PUBLIC_BASE_URL to that URL and redeploy:
 let PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
 
 // ----------- EXPRESS APP + STORAGE -------------
@@ -27,7 +27,7 @@ fs.mkdirSync(TMP_DIR, { recursive: true });
 /** id -> { filepath, mime, t } */
 const files = new Map();
 
-// Simple TTL cleanup (15 minutes)
+// TTL cleanup (15 minutes)
 setInterval(() => {
   const now = Date.now();
   for (const [id, rec] of files.entries()) {
@@ -74,8 +74,6 @@ async function doExport({ input_format, output_format, content }) {
 }
 
 // ---------- HTTP endpoints ----------
-
-// For quick sanity tests without MCP
 app.get("/healthz", async (req, res) => {
   try {
     const r = await axios.get(`${PANDOC_BASE}/healthz`);
@@ -85,7 +83,6 @@ app.get("/healthz", async (req, res) => {
   }
 });
 
-// Public download endpoint (one-time-ish; TTL 15 min)
 app.get("/download/:id", (req, res) => {
   const rec = files.get(req.params.id);
   if (!rec) return res.status(404).send("Not found");
@@ -96,7 +93,6 @@ app.get("/download/:id", (req, res) => {
   fs.createReadStream(filepath).pipe(res);
 });
 
-// Optional: allow HTTP export for manual testing
 app.post("/export", async (req, res) => {
   try {
     const { input_format, output_format, content } = req.body || {};
@@ -108,10 +104,7 @@ app.post("/export", async (req, res) => {
 });
 
 // ----------- MCP SERVER (REMOTE) -------------
-const mcp = new Server({
-  name: "mcp-pandoc-tools",
-  version: "1.0.0"
-});
+const mcp = new Server({ name: "mcp-pandoc-tools", version: "1.0.0" });
 
 // Tool: convert_to_pdf
 mcp.tool(
@@ -155,7 +148,7 @@ mcp.tool(
   }
 );
 
-// Mount the SSE endpoint for Claude
+// SSE endpoint for Claude Remote MCP
 app.use("/sse", sseMiddleware(mcp));
 
 app.listen(PORT, () => {
